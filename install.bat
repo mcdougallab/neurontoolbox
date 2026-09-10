@@ -3,6 +3,7 @@ setlocal EnableDelayedExpansion
 
 set "TOOLBOX_DIR=%~dp0"
 if "!TOOLBOX_DIR:~-1!"=="\" set "TOOLBOX_DIR=!TOOLBOX_DIR:~0,-1!"
+set "INSTALL_STATE_FILE=!TOOLBOX_DIR!\.nrnml_install_state.cmd"
 
 echo.
 echo === Step 1: Locating Python ^& NEURON ===
@@ -28,7 +29,7 @@ del "%TEMP%\nrnml_nrndir.txt" >nul 2>&1
 if defined _NRN_CANDIDATE (
     if exist "!_NRN_CANDIDATE!\lib\libnrniv.dll" (
         set "NRN_DATA_DIR=!_NRN_CANDIDATE!"
-        echo   Found NEURON (pip) at: !NRN_DATA_DIR!
+        echo   Found NEURON ^(pip^) at: !NRN_DATA_DIR!
     )
 )
 
@@ -50,8 +51,11 @@ if not defined NRN_DATA_DIR (
 
 :: pip installs put the DLL under lib\, standard installers put it under bin\
 set "LIBNRNIV="
+set "NRN_RUNTIME_DIR="
 if exist "!NRN_DATA_DIR!\lib\libnrniv.dll" set "LIBNRNIV=!NRN_DATA_DIR!\lib\libnrniv.dll"
+if exist "!NRN_DATA_DIR!\lib\libnrniv.dll" set "NRN_RUNTIME_DIR=!NRN_DATA_DIR!\lib"
 if exist "!NRN_DATA_DIR!\bin\libnrniv.dll" set "LIBNRNIV=!NRN_DATA_DIR!\bin\libnrniv.dll"
+if exist "!NRN_DATA_DIR!\bin\libnrniv.dll" set "NRN_RUNTIME_DIR=!NRN_DATA_DIR!\bin"
 if not defined LIBNRNIV (
     echo   ERROR: libnrniv.dll not found under !NRN_DATA_DIR!
     exit /b 1
@@ -67,6 +71,7 @@ if not exist "!NEURONAPI_H!" (
 echo   libnrniv:    !LIBNRNIV!
 echo   neuronapi.h: !NEURONAPI_H!
 echo   HOC dir:     !HOC_DIR!
+echo   runtime dir: !NRN_RUNTIME_DIR!
 
 :: ── Step 2: Find MATLAB ──────────────────────────────────────────────────────
 echo.
@@ -121,31 +126,18 @@ if not exist "!CPP_FILE!" (
 :: Patch to a temp file — the original source is never modified
 set "PATCHED_CPP=%TEMP%\neuron_api_patched.cpp"
 
-:: Write and run Python patcher
-set "PATCHER=%TEMP%\nrnml_patch.py"
-(
-    echo import sys, os
-    echo src, dst, api_h, nrniv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-    echo with open(src, encoding='utf-8'^) as f: content = f.read(^)
-    echo q, bs = chr(34^), chr(92^)
-    echo old_api  = '#include ' + q + r'C:\nrn\include\neuronapi.h' + q
-    echo new_api  = '#include ' + q + api_h + q
-    echo old_nrn  = 'DLL_LOAD(' + q + r'c:\\nrn\\bin\\libnrniv.dll' + q + ')'
-    echo new_nrn  = 'DLL_LOAD(' + q + nrniv.replace(bs, bs*2^) + q + ')'
-    echo for old, new, label in [(old_api,new_api,'neuronapi.h'),(old_nrn,new_nrn,'libnrniv')]:
-    echo     if old not in content: print('  WARNING: pattern not found for '+label^)
-    echo     else: content = content.replace(old, new^)
-    echo with open(dst, 'w', encoding='utf-8'^) as f: f.write(content^)
-    echo print('  Patched: '+dst^)
-) > "!PATCHER!"
+:: Use the checked-in patch helper to avoid brittle batch escaping.
+set "PATCHER=!TOOLBOX_DIR!\tools\nrnml_patch.py"
+if not exist "!PATCHER!" (
+    echo   ERROR: Not found: !PATCHER!
+    exit /b 1
+)
 
 "%_PYTHON%" "!PATCHER!" "!CPP_FILE!" "!PATCHED_CPP!" "!NEURONAPI_H!" "!LIBNRNIV!"
 if errorlevel 1 (
     echo   ERROR: Failed to patch neuron_api.cpp
-    del "!PATCHER!" >nul 2>&1
     exit /b 1
 )
-del "!PATCHER!" >nul 2>&1
 echo   neuronapi.h ^-^> !NEURONAPI_H!
 echo   libnrniv    ^-^> !LIBNRNIV!
 
@@ -161,12 +153,12 @@ echo === Step 5: Compiling neuron_api MEX ===
 :: Forward-slash path required by MATLAB's cd() and fullfile()
 set "TOOLBOX_FWD=!TOOLBOX_DIR:\=/!"
 set "PATCHED_FWD=!PATCHED_CPP:\=/!"
-set "MEX_CMDS=mex('CXXFLAGS=-std=c++17', '-output', fullfile('!TOOLBOX_FWD!','neuron_api'), '!PATCHED_FWD!')"
+set "MEX_CMDS=mex('CXXFLAGS=$CXXFLAGS -std=c++17', '-output', fullfile('!TOOLBOX_FWD!','neuron_api'), '!PATCHED_FWD!')"
 
 echo   Trying mex ...
 "!MATLAB_BIN!" -batch "!MEX_CMDS!" >nul 2>&1
 if not errorlevel 1 (
-    echo   MEX compilation succeeded (via mex)
+    echo   MEX compilation succeeded ^(via mex^)
     del "!PATCHED_CPP!" >nul 2>&1
     goto :mex_done
 )
@@ -202,33 +194,34 @@ echo   Built: !MEX_OUT!
 echo.
 echo === Step 6: Configuring user environment ===
 
-:: Use Python + winreg for reliable append-without-duplicate and broadcast
-set "ENV_UPDATER=%TEMP%\nrnml_setenv.py"
-(
-    echo import winreg, ctypes, sys
-    echo def append_env(name, value^):
-    echo     key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment', 0,
-    echo                          winreg.KEY_READ ^| winreg.KEY_WRITE^)
-    echo     try: cur, _ = winreg.QueryValueEx(key, name^)
-    echo     except FileNotFoundError: cur = ''
-    echo     parts = [p for p in cur.split(';'^) if p]
-    echo     if value in parts:
-    echo         print('  Already in ' + name + ', skipping'^)
-    echo     else:
-    echo         parts.append(value^)
-    echo         winreg.SetValueEx(key, name, 0, winreg.REG_EXPAND_SZ, ';'.join(parts^)^)
-    echo         print('  Updated ' + name^)
-    echo     winreg.CloseKey(key^)
-    echo for name, value in zip(sys.argv[1::2], sys.argv[2::2]^):
-    echo     append_env(name, value^)
-    echo ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, 'Environment', 2, 5000, None^)
-) > "!ENV_UPDATER!"
+:: Use the checked-in helper for reliable append-without-duplicate and broadcast.
+set "ENV_UPDATER=!TOOLBOX_DIR!\tools\nrnml_setenv.py"
+set "ENV_CONTAINS=!TOOLBOX_DIR!\tools\nrnml_env_contains.py"
+if not exist "!ENV_UPDATER!" (
+    echo   ERROR: Not found: !ENV_UPDATER!
+    exit /b 1
+)
+if not exist "!ENV_CONTAINS!" (
+    echo   ERROR: Not found: !ENV_CONTAINS!
+    exit /b 1
+)
+
+set "NRNML_ADDED_MATLABPATH=1"
+"%_PYTHON%" "!ENV_CONTAINS!" MATLABPATH "!TOOLBOX_DIR!" >nul 2>&1
+if not errorlevel 1 set "NRNML_ADDED_MATLABPATH=0"
+
+set "NRNML_ADDED_HOC_DIR=1"
+"%_PYTHON%" "!ENV_CONTAINS!" HOC_LIBRARY_PATH "!HOC_DIR!" >nul 2>&1
+if not errorlevel 1 set "NRNML_ADDED_HOC_DIR=0"
+
+set "NRNML_ADDED_RUNTIME_DIR=1"
+"%_PYTHON%" "!ENV_CONTAINS!" PATH "!NRN_RUNTIME_DIR!" >nul 2>&1
+if not errorlevel 1 set "NRNML_ADDED_RUNTIME_DIR=0"
 
 "%_PYTHON%" "!ENV_UPDATER!" ^
     MATLABPATH      "!TOOLBOX_DIR!" ^
     HOC_LIBRARY_PATH "!HOC_DIR!" ^
-    PATH            "!NRN_DATA_DIR!\bin"
-del "!ENV_UPDATER!" >nul 2>&1
+    PATH            "!NRN_RUNTIME_DIR!"
 
 :: startup.m runs on every MATLAB launch regardless of how MATLAB was started
 echo   Updating MATLAB startup.m ...
@@ -236,20 +229,38 @@ echo   Updating MATLAB startup.m ...
 set "MATLAB_USERPATH="
 set /p MATLAB_USERPATH=<"%TEMP%\nrnml_upath.txt"
 del "%TEMP%\nrnml_upath.txt" >nul 2>&1
+for /f "tokens=1 delims=;" %%i in ("!MATLAB_USERPATH!") do set "MATLAB_USERPATH=%%~i"
 if not defined MATLAB_USERPATH set "MATLAB_USERPATH=%USERPROFILE%\Documents\MATLAB"
 if not exist "!MATLAB_USERPATH!" mkdir "!MATLAB_USERPATH!"
 set "STARTUP_M=!MATLAB_USERPATH!\startup.m"
 set "ADDPATH_LINE=addpath('!TOOLBOX_DIR!');" 
+set "NRNML_ADDED_STARTUP_LINE=1"
 findstr /c:"!TOOLBOX_DIR!" "!STARTUP_M!" >nul 2>&1
 if errorlevel 1 (
     echo !ADDPATH_LINE! >> "!STARTUP_M!"
     echo   Updated !STARTUP_M!
 ) else (
+    set "NRNML_ADDED_STARTUP_LINE=0"
     echo   Already in startup.m, skipping
 )
 
 :: ── Done ─────────────────────────────────────────────────────────────────────
 echo.
+echo   Writing uninstall state ...
+> "!INSTALL_STATE_FILE!" (
+    echo @echo off
+    echo set "NRNML_STATE_VERSION=1"
+    echo set "NRNML_TOOLBOX_DIR=!TOOLBOX_DIR!"
+    echo set "NRNML_HOC_DIR=!HOC_DIR!"
+    echo set "NRNML_RUNTIME_DIR=!NRN_RUNTIME_DIR!"
+    echo set "NRNML_STARTUP_M=!STARTUP_M!"
+    echo set "NRNML_STARTUP_LINE=!ADDPATH_LINE!"
+    echo set "NRNML_ADDED_MATLABPATH=!NRNML_ADDED_MATLABPATH!"
+    echo set "NRNML_ADDED_HOC_DIR=!NRNML_ADDED_HOC_DIR!"
+    echo set "NRNML_ADDED_RUNTIME_DIR=!NRNML_ADDED_RUNTIME_DIR!"
+    echo set "NRNML_ADDED_STARTUP_LINE=!NRNML_ADDED_STARTUP_LINE!"
+)
+echo   State file: !INSTALL_STATE_FILE!
 echo === Installation complete ===
 echo.
 echo Open a new Command Prompt so the updated environment takes effect,
